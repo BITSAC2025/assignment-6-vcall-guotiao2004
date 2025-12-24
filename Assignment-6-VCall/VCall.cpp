@@ -39,108 +39,98 @@ void Andersen::runPointerAnalysis()
     // TODO: complete this method. Point-to set and worklist are defined in A5Header.h
     //  The implementation of constraint graph is provided in the SVF library
     
-    WorkList<unsigned> candidates;
+    WorkList<unsigned> wList;
 
-    for (auto const& pair : *consg)
-    {
-        SVF::ConstraintNode* node = pair.second;
-        SVF::NodeID nodeId = pair.first;
+    // Helper lambda to check existence before adding a Copy edge (avoids graph explosion)
+    auto tryAddCopyEdge = [&](unsigned srcId, unsigned dstId) -> bool {
+        auto* sNode = consg->getConstraintNode(srcId);
+        if (!sNode) return false;
 
-        for (auto edge : node->getAddrInEdges())
-        {
-            if (auto addrEdge = SVF::SVFUtil::dyn_cast<SVF::AddrCGEdge>(edge))
-            {
-                if (pts[nodeId].insert(addrEdge->getSrcID()).second)
-                {
-                    candidates.push(nodeId);
+        // Scan existing edges to avoid duplicates
+        for (auto* e : sNode->getCopyOutEdges()) {
+            if (e->getDstID() == dstId) return false;
+        }
+
+        consg->addCopyCGEdge(srcId, dstId);
+        return true;
+    };
+
+    // Phase 1: Initialize points-to sets with Address-of constraints (p = &a)
+    for (auto const& item : *consg) {
+        auto nodeId = item.first;
+        auto* node = item.second;
+
+        for (auto* edge : node->getAddrInEdges()) {
+            if (auto* addr = SVF::SVFUtil::dyn_cast<SVF::AddrCGEdge>(edge)) {
+                // If insertion is successful (element was new), add to worklist
+                if (pts[nodeId].insert(addr->getSrcID()).second) {
+                    wList.push(nodeId);
                 }
             }
         }
     }
 
-    while (!candidates.empty())
-    {
-        SVF::NodeID currId = candidates.pop();
-        SVF::ConstraintNode* currNode = consg->getConstraintNode(currId);
-        const auto& currPts = pts[currId];
+    // Phase 2: Worklist algorithm for transitive closure
+    while (!wList.empty()) {
+        auto topId = wList.pop();
+        auto* topNode = consg->getConstraintNode(topId);
+        const auto& topPts = pts[topId]; // Current points-to set
 
-        
-        for (SVF::NodeID objId : currPts)
-        {
-            for (auto edge : currNode->getStoreInEdges())
-            {
-                if (auto storeEdge = SVF::SVFUtil::dyn_cast<SVF::StoreCGEdge>(edge))
-                {
-                    SVF::NodeID srcId = storeEdge->getSrcID();
-                    bool edgeExists = false;
-                    auto srcNode = consg->getConstraintNode(srcId);
-                    for (auto outEdge : srcNode->getCopyOutEdges()) {
-                        if (outEdge->getDstID() == objId) {
-                            edgeExists = true;
-                            break;
-                        }
-                    }
-                    
-                    if (!edgeExists) {
-                        consg->addCopyCGEdge(srcId, objId);
-                        candidates.push(srcId);
+        // 2a. Handle Complex Constraints (Load/Store)
+        // Iterate over all objects 'o' that 'topId' points to
+        for (auto o : topPts) {
+            
+            // Store: *topId = src  =>  Add Copy Edge: src -> o
+            for (auto* edge : topNode->getStoreInEdges()) {
+                if (auto* store = SVF::SVFUtil::dyn_cast<SVF::StoreCGEdge>(edge)) {
+                    if (tryAddCopyEdge(store->getSrcID(), o)) {
+                        // If edge is new, process src to propagate its values
+                        wList.push(store->getSrcID());
                     }
                 }
             }
 
-            for (auto edge : currNode->getLoadOutEdges())
-            {
-                if (auto loadEdge = SVF::SVFUtil::dyn_cast<SVF::LoadCGEdge>(edge))
-                {
-                    SVF::NodeID dstId = loadEdge->getDstID();
-                    bool edgeExists = false;
-                    auto objNode = consg->getConstraintNode(objId);
-                    if (objNode) {
-                        for (auto outEdge : objNode->getCopyOutEdges()) {
-                            if (outEdge->getDstID() == dstId) {
-                                edgeExists = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (!edgeExists) {
-                        consg->addCopyCGEdge(objId, dstId);
-                        candidates.push(objId);
+            // Load: dst = *topId  =>  Add Copy Edge: o -> dst
+            for (auto* edge : topNode->getLoadOutEdges()) {
+                if (auto* load = SVF::SVFUtil::dyn_cast<SVF::LoadCGEdge>(edge)) {
+                    if (tryAddCopyEdge(o, load->getDstID())) {
+                        // If edge is new, process o to propagate its values
+                        wList.push(o);
                     }
                 }
             }
         }
 
-        for (auto edge : currNode->getCopyOutEdges())
-        {
-            if (auto copyEdge = SVF::SVFUtil::dyn_cast<SVF::CopyCGEdge>(edge))
-            {
-                SVF::NodeID dstId = copyEdge->getDstID();
-                if (pts[dstId].insert(currPts.begin(), currPts.end()))
-                {
-                    candidates.push(dstId); 
+        // 2b. Handle Simple Copy Constraints: dst = topId
+        for (auto* edge : topNode->getCopyOutEdges()) {
+            if (auto* copy = SVF::SVFUtil::dyn_cast<SVF::CopyCGEdge>(edge)) {
+                auto dst = copy->getDstID();
+                auto& dstSet = pts[dst];
+                bool isChanged = false;
+
+                // Propagate everything topId points to -> dst
+                for (auto val : topPts) {
+                    if (dstSet.insert(val).second) isChanged = true;
                 }
+
+                if (isChanged) wList.push(dst);
             }
         }
 
-        for (auto edge : currNode->getGepOutEdges())
-        {
-            if (auto gepEdge = SVF::SVFUtil::dyn_cast<SVF::GepCGEdge>(edge))
-            {
-                SVF::NodeID dstId = gepEdge->getDstID();
-                bool changed = false;
-                for (SVF::NodeID o : currPts)
-                {
-                    SVF::NodeID fieldInfo = consg->getGepObjVar(o, gepEdge);
-                    if (pts[dstId].insert(fieldInfo).second) {
-                        changed = true;
-                    }
+        // 2c. Handle GEP Constraints: dst = &topId[i]
+        for (auto* edge : topNode->getGepOutEdges()) {
+            if (auto* gep = SVF::SVFUtil::dyn_cast<SVF::GepCGEdge>(edge)) {
+                auto dst = gep->getDstID();
+                auto& dstSet = pts[dst];
+                bool isChanged = false;
+
+                // Calculate offset for each object topId points to
+                for (auto val : topPts) {
+                    auto offsetObj = consg->getGepObjVar(val, gep);
+                    if (dstSet.insert(offsetObj).second) isChanged = true;
                 }
-                
-                if (changed) {
-                    candidates.push(dstId);
-                }
+
+                if (isChanged) wList.push(dst);
             }
         }
     }
@@ -152,26 +142,22 @@ void Andersen::updateCallGraph(SVF::CallGraph* cg)
     // TODO: complete this method.
     //  The implementation of call graph is provided in the SVF library
     
-    auto& indirectCalls = consg->getIndirectCallsites();
-    
-    for (auto it = indirectCalls.begin(); it != indirectCalls.end(); ++it)
-    {
-        const SVF::CallICFGNode* cNode = it->first;
-        SVF::NodeID funcPtrId = it->second;
+    // Iterate over all indirect call sites (e.g., function pointers)
+    for (const auto& entry : consg->getIndirectCallsites()) {
+        auto* callNode = entry.first;
+        auto funcPtrId = entry.second;
 
+        // If the pointer has no points-to targets, skip
         if (pts.find(funcPtrId) == pts.end()) continue;
 
-        for (SVF::NodeID targetId : pts[funcPtrId])
-        {
-            if (consg->isFunction(targetId))
-            {
-                const SVF::Function* calleeFunc = consg->getFunction(targetId);
-                const SVF::Function* callerFunc = cNode->getCaller();
-                
-                if (!cg->hasCallGraphEdge(callerFunc->getId(), calleeFunc->getId()))
-                {
-                     cg->addIndirectCallGraphEdge(cNode, callerFunc, calleeFunc);
-                }
+        auto* callerFunc = callNode->getCaller();
+        const auto& possibleTargets = pts[funcPtrId];
+
+        for (auto targetId : possibleTargets) {
+            // Verify the target is actually a function before adding edge
+            if (consg->isFunction(targetId)) {
+                auto* calleeFunc = consg->getFunction(targetId);
+                cg->addIndirectCallGraphEdge(callNode, callerFunc, calleeFunc);
             }
         }
     }
