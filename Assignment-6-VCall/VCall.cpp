@@ -36,100 +36,111 @@ int main(int argc, char** argv)
 
 void Andersen::runPointerAnalysis()
 {
-    WorkList<unsigned> nodeQueue;
+    // TODO: complete this method. Point-to set and worklist are defined in A5Header.h
+    //  The implementation of constraint graph is provided in the SVF library
+    
+    WorkList<unsigned> candidates;
 
-    auto addCopyEdge = [&](unsigned src, unsigned dst) -> bool
+    for (auto const& pair : *consg)
     {
-        auto *srcNode = consg->getConstraintNode(src);
-        if (!srcNode) return false;
-
-        for (auto edge : srcNode->getCopyOutEdges())
-        {
-            if (edge->getDstID() == dst)
-                return false;
-        }
-
-        consg->addCopyCGEdge(src, dst);
-        return true;
-    };
-
-    for (auto iter = consg->begin(); iter != consg->end(); ++iter)
-    {
-        auto nodeId = iter->first;
-        SVF::ConstraintNode *node = iter->second;
+        SVF::ConstraintNode* node = pair.second;
+        SVF::NodeID nodeId = pair.first;
 
         for (auto edge : node->getAddrInEdges())
         {
-            if (auto *addrEdge = SVF::SVFUtil::dyn_cast<SVF::AddrCGEdge>(edge))
+            if (auto addrEdge = SVF::SVFUtil::dyn_cast<SVF::AddrCGEdge>(edge))
             {
-                auto srcId = addrEdge->getSrcID();
-                if (pts[nodeId].insert(srcId).second)
+                if (pts[nodeId].insert(addrEdge->getSrcID()).second)
                 {
-                    nodeQueue.push(nodeId);
+                    candidates.push(nodeId);
                 }
             }
         }
     }
 
-    while (!nodeQueue.empty())
+    while (!candidates.empty())
     {
-        auto currID = nodeQueue.pop();
-        auto *currNode = consg->getConstraintNode(currID);
-        auto &currPts = pts[currID];
+        SVF::NodeID currId = candidates.pop();
+        SVF::ConstraintNode* currNode = consg->getConstraintNode(currId);
+        const auto& currPts = pts[currId];
 
-        for (auto obj : currPts)
+        
+        for (SVF::NodeID objId : currPts)
         {
             for (auto edge : currNode->getStoreInEdges())
             {
-                if (auto *storeEdge = SVF::SVFUtil::dyn_cast<SVF::StoreCGEdge>(edge))
+                if (auto storeEdge = SVF::SVFUtil::dyn_cast<SVF::StoreCGEdge>(edge))
                 {
-                    if (addCopyEdge(storeEdge->getSrcID(), obj))
-                        nodeQueue.push(storeEdge->getSrcID());
+                    SVF::NodeID srcId = storeEdge->getSrcID();
+                    bool edgeExists = false;
+                    auto srcNode = consg->getConstraintNode(srcId);
+                    for (auto outEdge : srcNode->getCopyOutEdges()) {
+                        if (outEdge->getDstID() == objId) {
+                            edgeExists = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!edgeExists) {
+                        consg->addCopyCGEdge(srcId, objId);
+                        candidates.push(srcId);
+                    }
                 }
             }
 
             for (auto edge : currNode->getLoadOutEdges())
             {
-                if (auto *loadEdge = SVF::SVFUtil::dyn_cast<SVF::LoadCGEdge>(edge))
+                if (auto loadEdge = SVF::SVFUtil::dyn_cast<SVF::LoadCGEdge>(edge))
                 {
-                    if (addCopyEdge(obj, loadEdge->getDstID()))
-                        nodeQueue.push(obj);
+                    SVF::NodeID dstId = loadEdge->getDstID();
+                    bool edgeExists = false;
+                    auto objNode = consg->getConstraintNode(objId);
+                    if (objNode) {
+                        for (auto outEdge : objNode->getCopyOutEdges()) {
+                            if (outEdge->getDstID() == dstId) {
+                                edgeExists = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!edgeExists) {
+                        consg->addCopyCGEdge(objId, dstId);
+                        candidates.push(objId);
+                    }
                 }
             }
         }
 
         for (auto edge : currNode->getCopyOutEdges())
         {
-            if (auto *copyEdge = SVF::SVFUtil::dyn_cast<SVF::CopyCGEdge>(edge))
+            if (auto copyEdge = SVF::SVFUtil::dyn_cast<SVF::CopyCGEdge>(edge))
             {
-                auto dstID = copyEdge->getDstID();
-                auto &dstPts = pts[dstID];
-                bool changed = false;
-
-                for (auto val : currPts)
-                    changed |= dstPts.insert(val).second;
-
-                if (changed)
-                    nodeQueue.push(dstID);
+                SVF::NodeID dstId = copyEdge->getDstID();
+                if (pts[dstId].insert(currPts.begin(), currPts.end()))
+                {
+                    candidates.push(dstId); 
+                }
             }
         }
 
         for (auto edge : currNode->getGepOutEdges())
         {
-            if (auto *gepEdge = SVF::SVFUtil::dyn_cast<SVF::GepCGEdge>(edge))
+            if (auto gepEdge = SVF::SVFUtil::dyn_cast<SVF::GepCGEdge>(edge))
             {
-                auto dstID = gepEdge->getDstID();
-                auto &dstPts = pts[dstID];
+                SVF::NodeID dstId = gepEdge->getDstID();
                 bool changed = false;
-
-                for (auto val : currPts)
+                for (SVF::NodeID o : currPts)
                 {
-                    auto gepObj = consg->getGepObjVar(val, gepEdge);
-                    changed |= dstPts.insert(gepObj).second;
+                    SVF::NodeID fieldInfo = consg->getGepObjVar(o, gepEdge);
+                    if (pts[dstId].insert(fieldInfo).second) {
+                        changed = true;
+                    }
                 }
-
-                if (changed)
-                    nodeQueue.push(dstID);
+                
+                if (changed) {
+                    candidates.push(dstId);
+                }
             }
         }
     }
@@ -138,20 +149,29 @@ void Andersen::runPointerAnalysis()
 
 void Andersen::updateCallGraph(SVF::CallGraph* cg)
 {
-    for (const auto &siteInfo : consg->getIndirectCallsites())
+    // TODO: complete this method.
+    //  The implementation of call graph is provided in the SVF library
+    
+    auto& indirectCalls = consg->getIndirectCallsites();
+    
+    for (auto it = indirectCalls.begin(); it != indirectCalls.end(); ++it)
     {
-        auto *callNode = siteInfo.first;
-        const auto calleePtrId = siteInfo.second;
-        
-        auto *caller = callNode->getCaller();
-        const auto &candidateTargets = pts[calleePtrId];
+        const SVF::CallICFGNode* cNode = it->first;
+        SVF::NodeID funcPtrId = it->second;
 
-        for (auto objId : candidateTargets)
+        if (pts.find(funcPtrId) == pts.end()) continue;
+
+        for (SVF::NodeID targetId : pts[funcPtrId])
         {
-            if (consg->isFunction(objId))
+            if (consg->isFunction(targetId))
             {
-                auto *callee = consg->getFunction(objId);
-                cg->addIndirectCallGraphEdge(callNode, caller, callee);
+                const SVF::Function* calleeFunc = consg->getFunction(targetId);
+                const SVF::Function* callerFunc = cNode->getCaller();
+                
+                if (!cg->hasCallGraphEdge(callerFunc->getId(), calleeFunc->getId()))
+                {
+                     cg->addIndirectCallGraphEdge(cNode, callerFunc, calleeFunc);
+                }
             }
         }
     }
