@@ -1,1 +1,1 @@
-Total: 12, Correct: 7, Wrong: 5
+Total: 12, Correct: 12, Wrong: 0
